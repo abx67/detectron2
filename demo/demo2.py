@@ -1,0 +1,184 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import argparse
+import glob
+import multiprocessing as mp
+import os
+import time
+import cv2
+import tqdm
+
+from detectron2.config import get_cfg
+from detectron2.data.detection_utils import read_image
+from detectron2.utils.logger import setup_logger
+
+from predictor import VisualizationDemo
+
+import json
+
+# constants
+WINDOW_NAME = "COCO detections"
+
+count = 0
+
+def setup_cfg(args):
+    # load config from file and command-line arguments
+    cfg = get_cfg()
+    cfg.merge_from_file(args.config_file)
+    cfg.merge_from_list(args.opts)
+    # Set score_threshold for builtin models
+    cfg.MODEL.RETINANET.SCORE_THRESH_TEST = args.confidence_threshold
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = args.confidence_threshold
+    cfg.MODEL.PANOPTIC_FPN.COMBINE.INSTANCES_CONFIDENCE_THRESH = args.confidence_threshold
+    cfg.freeze()
+    return cfg
+
+
+def get_parser():
+    parser = argparse.ArgumentParser(description="Detectron2 Demo")
+    parser.add_argument(
+        "--config-file",
+        default="configs/quick_schedules/e2e_mask_rcnn_R_50_FPN_inference_acc_test.yaml",
+        metavar="FILE",
+        help="path to config file",
+    )
+    parser.add_argument("--webcam", action="store_true", help="Take inputs from webcam.")
+    parser.add_argument("--video-input", help="Path to video file.")
+    parser.add_argument("--input", nargs="+", help="A list of space separated input images")
+    parser.add_argument(
+        "--output",
+        help="A file or directory to save output visualizations. "
+        "If not given, will show output in an OpenCV window.",
+    )
+
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.5,
+        help="Minimum score for instance predictions to be shown",
+    )
+    parser.add_argument(
+        "--opts",
+        help="Modify model config options using the command-line",
+        default=[],
+        nargs=argparse.REMAINDER,
+    )
+    return parser
+
+
+def create_annotation(image_folder, json_path, confidence_thresh = 0.8):
+    json_dict = {"images": [], "type": "instances", "annotations": [], "categories": []}
+
+    mp.set_start_method("spawn", force=True)
+    args = get_parser().parse_args()
+    logger = setup_logger()
+    logger.info("Arguments: " + str(args))
+
+    cfg = setup_cfg(args)
+
+    demo = VisualizationDemo(cfg)
+
+    image_path = {}
+    for path, subdirs, files in os.walk(image_folder):
+        for name in files:
+            print(name)
+            if name.endswith('.jpg') or \
+               name.endswith('.png') or \
+               name.endswith('.JPG') or \
+               name.endswith('.PNG') or \
+               name.endswith('.jpeg') or \
+               name.endswith('.JPEG'):
+                image_path[name] = os.path.join(path, name)
+
+    print("length: ", len(image_path.keys()))
+    for path in tqdm.tqdm(image_path.keys(), disable=not args.output):
+        # use PIL, to be consistent with evaluation
+        start_time = time.time()
+        try:
+            img = read_image(image_path[path], format="BGR")
+            # run detector
+            predictions, visualized_output, shape = demo.run_on_image(img)
+        except:
+            print("except")
+            continue
+        height, width, channel = shape
+
+        global count
+        ## append image info
+        image = {
+            "file_name": str(path),
+            "height": str(height),
+            "width": str(width),
+            "id": str(count),
+        }
+        count += 1
+        # if count > 10:
+        #     break
+        json_dict["images"].append(image)
+        ## append annotation info
+        bnd_id = 0
+        for i in range(len(predictions["instances"].pred_boxes)):
+            if predictions["instances"].scores[i] > confidence_thresh and predictions["instances"].pred_classes[i] in [0, 2, 5, 7]:
+                # print(predictions["instances"].pred_boxes[i].tensor)
+                x_center, y_center, o_width, o_height = predictions["instances"].pred_boxes[i].tensor[0].cpu().detach().numpy()
+                score = predictions["instances"].scores[i].cpu().detach().numpy()
+                pred_class = predictions["instances"].pred_classes[i].cpu().detach().numpy()
+
+                # print(x_center, y_center, o_width, o_height, score)
+                ann = {
+                    "area": str(o_width * o_height),
+                    "iscrowd": 0,
+                    "image_id": str(count),
+                    "bbox": [str(int(x_center - o_width / 2)), str(int(y_center - o_height / 2)), str(o_width), str(o_height)],
+                    "category_id": str(pred_class + 1),
+                    "id": str(bnd_id),
+                    "ignore": 0,
+                    "segmentation": [],
+                }
+                bnd_id += 1
+                json_dict["annotations"].append(ann)
+
+        # cat = {"supercategory": "none", "id": cid, "name": cate}
+        # json_dict["categories"].append(cat)
+
+        # if args.output:
+        #     if os.path.isdir(args.output):
+        #         assert os.path.isdir(args.output), args.output
+        #         out_filename = os.path.join(args.output, os.path.basename(path))
+        #     else:
+        #         assert len(args.input) == 1, "Please specify a directory with args.output"
+        #         out_filename = args.output
+        #     visualized_output.save(out_filename)
+        # print("pred_boxes: ", predictions["instances"].pred_boxes)
+        # print("scores: ", predictions["instances"].scores)
+        # print("pred_classes: ", predictions["instances"].pred_classes)
+        # print("shape: ", width, height, channel)
+        # logger.info(
+        #     "{}: detected {} instances in {:.2f}s".format(
+        #         path, len(predictions["instances"]), time.time() - start_time
+        #     )
+        # )
+        logger.info(("progress: {:.0f} / {:.0f}".format(count, len(image_path.keys()))))
+
+    ## append category info
+    cat = {"supercategory": "none", "id": str(1), "name": "person"}
+    json_dict["categories"].append(cat)
+    cat = {"supercategory": "none", "id": str(3), "name": "car"}
+    json_dict["categories"].append(cat)
+    cat = {"supercategory": "none", "id": str(6), "name": "bus"}
+    json_dict["categories"].append(cat)
+    cat = {"supercategory": "none", "id": str(8), "name": "truck"}
+    json_dict["categories"].append(cat)
+
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    json_fp = open(json_path, "w")
+    json_str = json.dumps(json_dict)
+    json_fp.write(json_str)
+    json_fp.close()
+
+def main():
+    json_path = "/work/20191107_coco.json"
+    image_folder = "/media/fanerror/Elements SE/20191107_maachine_annotation/"
+    create_annotation(image_folder, json_path)
+
+if __name__ == "__main__":
+    main()
